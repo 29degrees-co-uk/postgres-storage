@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -18,6 +19,11 @@ import (
 
 var (
 	_ certmagic.Storage = (*PostgresStorage)(nil)
+)
+
+const (
+	lockPollInterval    = 1 * time.Second
+	lockRefreshInterval = 5 * time.Second
 )
 
 type PostgresStorage struct {
@@ -34,6 +40,9 @@ type PostgresStorage struct {
 	SSLmode          string        `json:"sslmode,omitempty"` // Valid values for sslmode are: disable, require, verify-ca, verify-full
 	ConnectionString string        `json:"connection_string,omitempty"`
 	DisableDDL       bool          `json:"disable_ddl,omitempty"`
+
+	locks   map[string]context.CancelFunc // active lock keepalives, keyed by lock key
+	locksMu sync.Mutex
 }
 
 func init() {
@@ -216,53 +225,108 @@ expires timestamptz default current_timestamp
 	return tx.Commit()
 }
 
-// Lock the key and implement certmagic.Storage.Lock.
+// Lock acquires a distributed lock for the given key, blocking until the lock
+// is available or the context is canceled. If the existing lock has expired
+// (stale), it is claimed. A background goroutine keeps the lock fresh while
+// held. This implements certmagic.Storage.Lock.
 func (s *PostgresStorage) Lock(ctx context.Context, key string) error {
-	ctx, cancel := context.WithTimeout(ctx, s.QueryTimeout)
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		acquired, err := s.tryAcquireLock(ctx, key)
+		if err != nil {
+			return err
+		}
+		if acquired {
+			s.startLockRefresh(key)
+			return nil
+		}
+
+		// Lock is held by another instance — wait and retry
+		select {
+		case <-time.After(lockPollInterval):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// tryAcquireLock attempts to insert or claim the lock row. Returns true if the
+// lock was acquired. Stale locks (where expires <= now) are claimed atomically.
+func (s *PostgresStorage) tryAcquireLock(ctx context.Context, key string) (bool, error) {
+	qctx, cancel := context.WithTimeout(ctx, s.QueryTimeout)
 	defer cancel()
-
-	tx, err := s.Database.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-
-	if err := s.isLocked(tx, key); err != nil {
-		return err
-	}
 
 	expires := time.Now().Add(s.LockTimeout)
-	if _, err := tx.ExecContext(ctx, `insert into certmagic_locks (key, expires) values ($1, $2) on conflict (key) do update set expires = $2`, key, expires); err != nil {
-		return fmt.Errorf("failed to lock key: %s: %w", key, err)
+
+	// Attempt to insert a new lock row, or update an existing one only if it
+	// has expired. If a non-expired lock exists, the WHERE clause prevents the
+	// update and no row is affected.
+	result, err := s.Database.ExecContext(qctx, `
+		INSERT INTO certmagic_locks (key, expires)
+		VALUES ($1, $2)
+		ON CONFLICT (key) DO UPDATE SET expires = $2
+		WHERE certmagic_locks.expires <= CURRENT_TIMESTAMP
+	`, key, expires)
+	if err != nil {
+		return false, fmt.Errorf("failed to acquire lock %s: %w", key, err)
 	}
 
-	return tx.Commit()
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
 }
 
-// Unlock the key and implement certmagic.Storage.Unlock.
+// startLockRefresh launches a background goroutine that periodically extends
+// the lock's expiry so long-running operations don't have their lock stolen.
+func (s *PostgresStorage) startLockRefresh(key string) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	s.locksMu.Lock()
+	if s.locks == nil {
+		s.locks = make(map[string]context.CancelFunc)
+	}
+	s.locks[key] = cancel
+	s.locksMu.Unlock()
+
+	go func() {
+		ticker := time.NewTicker(lockRefreshInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				qctx, qcancel := context.WithTimeout(ctx, s.QueryTimeout)
+				expires := time.Now().Add(s.LockTimeout)
+				_, err := s.Database.ExecContext(qctx, `UPDATE certmagic_locks SET expires = $2 WHERE key = $1`, key, expires)
+				qcancel()
+				if err != nil && s.logger != nil {
+					s.logger.Error("failed to refresh lock", zap.String("key", key), zap.Error(err))
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+}
+
+// Unlock releases the distributed lock for the given key and stops its
+// background refresh goroutine. Implements certmagic.Storage.Unlock.
 func (s *PostgresStorage) Unlock(ctx context.Context, key string) error {
-	ctx, cancel := context.WithTimeout(ctx, s.QueryTimeout)
+	s.locksMu.Lock()
+	if cancel, ok := s.locks[key]; ok {
+		cancel()
+		delete(s.locks, key)
+	}
+	s.locksMu.Unlock()
+
+	qctx, cancel := context.WithTimeout(ctx, s.QueryTimeout)
 	defer cancel()
-	_, err := s.Database.ExecContext(ctx, `delete from certmagic_locks where key = $1`, key)
+	_, err := s.Database.ExecContext(qctx, `DELETE FROM certmagic_locks WHERE key = $1`, key)
 	return err
-}
-
-type queryer interface {
-	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
-}
-
-// isLocked returns nil if the key is not locked.
-func (s *PostgresStorage) isLocked(queryer queryer, key string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), s.QueryTimeout)
-	defer cancel()
-	row := queryer.QueryRowContext(ctx, `select exists(select 1 from certmagic_locks where key = $1 and expires > current_timestamp)`, key)
-	var locked bool
-	if err := row.Scan(&locked); err != nil {
-		return err
-	}
-	if locked {
-		return fmt.Errorf("key is locked: %s", key)
-	}
-	return nil
 }
 
 // Store puts value at key.
@@ -317,7 +381,7 @@ func (s *PostgresStorage) List(ctx context.Context, prefix string, recursive boo
 	if recursive {
 		return nil, fmt.Errorf("recursive not supported")
 	}
-	rows, err := s.Database.QueryContext(ctx, fmt.Sprintf(`select key from certmagic_data where key like '%s%%'`, prefix))
+	rows, err := s.Database.QueryContext(ctx, `select key from certmagic_data where key like $1`, prefix+"%")
 	if err != nil {
 		return nil, err
 	}
