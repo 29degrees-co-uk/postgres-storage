@@ -155,6 +155,7 @@ func NewStorage(c PostgresStorage) (certmagic.Storage, error) {
 		return nil, err
 	}
 	s := &PostgresStorage{
+		logger:       c.logger,
 		Database:     database,
 		QueryTimeout: c.QueryTimeout,
 		LockTimeout:  c.LockTimeout,
@@ -334,6 +335,13 @@ func (s *PostgresStorage) Store(ctx context.Context, key string, value []byte) e
 	ctx, cancel := context.WithTimeout(ctx, s.QueryTimeout)
 	defer cancel()
 	_, err := s.Database.ExecContext(ctx, "insert into certmagic_data (key, value) values ($1, $2) on conflict (key) do update set value = $2, modified = current_timestamp", key, value)
+	if s.logger != nil {
+		if err != nil {
+			s.logger.Error("storage Store: failed", zap.String("key", key), zap.Int("size", len(value)), zap.Error(err))
+		} else {
+			s.logger.Debug("storage Store: ok", zap.String("key", key), zap.Int("size", len(value)))
+		}
+	}
 	return err
 }
 
@@ -344,9 +352,21 @@ func (s *PostgresStorage) Load(ctx context.Context, key string) ([]byte, error) 
 	var value []byte
 	err := s.Database.QueryRowContext(ctx, "select value from certmagic_data where key = $1", key).Scan(&value)
 	if err == sql.ErrNoRows {
+		if s.logger != nil {
+			s.logger.Debug("storage Load: key not found", zap.String("key", key))
+		}
 		return nil, fs.ErrNotExist
 	}
-	return value, err
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Error("storage Load: query error", zap.String("key", key), zap.Error(err))
+		}
+		return value, err
+	}
+	if s.logger != nil {
+		s.logger.Debug("storage Load: found", zap.String("key", key), zap.Int("size", len(value)))
+	}
+	return value, nil
 }
 
 // Delete deletes key. An error should be
